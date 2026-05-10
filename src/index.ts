@@ -871,7 +871,6 @@ async function waitForForwardedPermissionApproval(
       });
       safeDeleteFile(responsePath, "forwarded permission response");
       safeDeleteFile(requestPath, "forwarded permission request");
-      cleanupPermissionForwardingLocationIfEmpty(location);
       return response ?? { approved: false, state: "denied" };
     }
 
@@ -886,7 +885,6 @@ async function waitForForwardedPermissionApproval(
     responsePath,
   });
   safeDeleteFile(requestPath, "forwarded permission request");
-  cleanupPermissionForwardingLocationIfEmpty(location);
   return { approved: false, state: "denied" };
 }
 
@@ -911,6 +909,12 @@ async function processForwardedPermissionRequests(ctx: ExtensionContext): Promis
     return;
   }
 
+  // Collect all valid requests first
+  const validRequests: Array<{
+    requestPath: string;
+    request: ForwardedPermissionRequest;
+  }> = [];
+
   for (const fileName of requestFiles) {
     const requestPath = join(location.requestsDir, fileName);
     const request = readForwardedPermissionRequest(requestPath);
@@ -927,33 +931,90 @@ async function processForwardedPermissionRequests(ctx: ExtensionContext): Promis
       continue;
     }
 
-    const forwardedPermissionLogDetails = {
-      requestId: request.id,
-      source: location.label,
-      requesterAgentName: request.requesterAgentName,
-      requesterSessionId: request.requesterSessionId,
-      targetSessionId: request.targetSessionId,
-      requestPath,
-    };
+    validRequests.push({ requestPath, request });
+  }
 
-    let decision: PermissionPromptDecision = { approved: false, state: "denied" };
-    if (shouldAutoApprovePermissionState("ask", extensionConfig)) {
-      writeReviewLog("forwarded_permission.auto_approved", forwardedPermissionLogDetails);
-      decision = { approved: true, state: "approved" };
-    } else {
-      writeReviewLog("forwarded_permission.prompted", forwardedPermissionLogDetails);
-      try {
-        decision = await requestPermissionDecisionFromUi(
-          ctx.ui,
-          "Permission Required (Subagent)",
-          formatForwardedPermissionPrompt(request),
-        );
-      } catch (error) {
-        logPermissionForwardingError("Failed to show forwarded permission confirmation dialog", error);
-        decision = { approved: false, state: "denied" };
-      }
+  if (validRequests.length === 0) {
+    cleanupPermissionForwardingLocationIfEmpty(location);
+    return;
+  }
+
+  // Determine decision: batch all requests into ONE permission dialog
+  let decision: PermissionPromptDecision = { approved: false, state: "denied" };
+
+  if (shouldAutoApprovePermissionState("ask", extensionConfig)) {
+    for (const { requestPath, request } of validRequests) {
+      writeReviewLog("forwarded_permission.auto_approved", {
+        requestId: request.id,
+        source: location.label,
+        requesterAgentName: request.requesterAgentName,
+        requesterSessionId: request.requesterSessionId,
+        targetSessionId: request.targetSessionId,
+        requestPath,
+      });
+    }
+    decision = { approved: true, state: "approved" };
+  } else {
+    // Build a consolidated permission prompt
+    let batchPrompt: string;
+    const batchLogDetails: Array<{
+      requestId: string;
+      source: string;
+      requesterAgentName: string;
+      requesterSessionId: string;
+      targetSessionId: string;
+      requestPath: string;
+    }> = [];
+
+    for (const { requestPath, request } of validRequests) {
+      const logEntry = {
+        requestId: request.id,
+        source: location.label,
+        requesterAgentName: request.requesterAgentName,
+        requesterSessionId: request.requesterSessionId,
+        targetSessionId: request.targetSessionId,
+        requestPath,
+      };
+      batchLogDetails.push(logEntry);
+      writeReviewLog("forwarded_permission.prompted", logEntry);
     }
 
+    if (validRequests.length === 1) {
+      // Single request: use the standard prompt format
+      batchPrompt = formatForwardedPermissionPrompt(validRequests[0].request);
+    } else {
+      // Multiple requests: consolidated batch prompt
+      const lines: string[] = [
+        `${validRequests.length} subagents are requesting permission to run:`,
+        "",
+      ];
+      for (let i = 0; i < validRequests.length; i++) {
+        const req = validRequests[i].request;
+        const agentName = req.requesterAgentName || "unknown";
+        const preview = req.message.split("\n")[0].slice(0, 200);
+        lines.push(`[${i + 1}] Agent '${agentName}': ${preview}${req.message.split("\n")[0].length > 200 ? "..." : ""}`);
+      }
+      lines.push("");
+      lines.push("Choose Yes to approve all, or No to deny all.");
+      batchPrompt = lines.join("\n");
+    }
+
+    try {
+      decision = await requestPermissionDecisionFromUi(
+        ctx.ui,
+        validRequests.length === 1
+          ? "Permission Required (Subagent)"
+          : `Permission Required (${validRequests.length} Subagents)`,
+        batchPrompt,
+      );
+    } catch (error) {
+      logPermissionForwardingError("Failed to show forwarded permission confirmation dialog", error);
+      decision = { approved: false, state: "denied" };
+    }
+  }
+
+  // Write responses for all requests using the same decision
+  for (const { requestPath, request } of validRequests) {
     const responsePath = join(location.responsesDir, `${request.id}.json`);
     writeReviewLog(decision.approved ? "forwarded_permission.approved" : "forwarded_permission.denied", {
       requestId: request.id,
@@ -965,6 +1026,16 @@ async function processForwardedPermissionRequests(ctx: ExtensionContext): Promis
       resolution: decision.state,
       denialReasonMetadata: createSensitiveLogMetadata(decision.denialReason),
     });
+
+    // Ensure responses directory exists before writing (defense against concurrent cleanup)
+    if (!ensureDirectoryExists(location.responsesDir, "permission forwarding responses")) {
+      logPermissionForwardingError(
+        `Failed to ensure responses directory exists before writing response for request ${request.id}`,
+      );
+      safeDeleteFile(requestPath, `${location.label} forwarded permission request`);
+      continue;
+    }
+
     try {
       writeJsonFileAtomic(responsePath, {
         approved: decision.approved,
@@ -974,7 +1045,10 @@ async function processForwardedPermissionRequests(ctx: ExtensionContext): Promis
         respondedAt: Date.now(),
       } satisfies ForwardedPermissionResponse);
     } catch (error) {
-      logPermissionForwardingError(`Failed to write ${location.label} forwarded permission response '${responsePath}'`, error);
+      logPermissionForwardingError(
+        `Failed to write ${location.label} forwarded permission response '${responsePath}'`,
+        error,
+      );
       continue;
     }
 
