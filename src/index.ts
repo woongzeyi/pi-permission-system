@@ -1458,6 +1458,24 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (event, ctx) => {
     refreshSessionRuntimeState(ctx);
 
+    // Apply tool permissions on startup so the system prompt includes all allowed tools
+    // from the start, avoiding a mismatch between startup and before_agent_start prompts
+    const agentName = resolveAgentName(ctx);
+    const allTools = pi.getAllTools();
+    const allowedTools: string[] = [];
+    for (const tool of allTools) {
+      const toolName = getEventToolName(tool);
+      if (!toolName) continue;
+      if (shouldExposeTool(toolName, agentName)) {
+        allowedTools.push(toolName);
+      }
+    }
+    const startupKey = createActiveToolsCacheKey(allowedTools);
+    if (shouldApplyCachedAgentStartState(lastActiveToolsCacheKey, startupKey)) {
+      pi.setActiveTools(allowedTools);
+      lastActiveToolsCacheKey = startupKey;
+    }
+
     if (event.reason === "reload") {
       writeDebugLog("lifecycle.reload", {
         triggeredBy: "session_start",
