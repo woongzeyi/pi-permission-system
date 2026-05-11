@@ -6,7 +6,6 @@ import { join, normalize } from "node:path";
 import { getNonEmptyString, isPathWithinDirectory, normalizePathForComparison, toRecord } from "./common.js";
 import {
   createActiveToolsCacheKey,
-  createBeforeAgentStartPromptStateKey,
   shouldApplyCachedAgentStartState,
 } from "./before-agent-start-cache.js";
 import {
@@ -42,7 +41,6 @@ import {
   resolveSkillPromptEntries,
   type SkillPromptEntry,
 } from "./skill-prompt-sanitizer.js";
-import { sanitizeAvailableToolsSection } from "./system-prompt-sanitizer.js";
 import { checkRequestedToolRegistration, getToolNameFromValue } from "./tool-registry.js";
 import type { PermissionCheckResult } from "./types.js";
 import { PERMISSION_SYSTEM_STATUS_KEY, syncPermissionSystemStatus } from "./status.js";
@@ -1108,7 +1106,6 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
   let activeSkillEntries: SkillPromptEntry[] = [];
   let lastKnownActiveAgentName: string | null = null;
   let lastActiveToolsCacheKey: string | null = null;
-  let lastPromptStateCacheKey: string | null = null;
   let permissionForwardingContext: ExtensionContext | null = null;
   let permissionForwardingTimer: NodeJS.Timeout | null = null;
   let isProcessingForwardedRequests = false;
@@ -1119,7 +1116,6 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
   const invalidateAgentStartCache = (): void => {
     activeSkillEntries = [];
     lastActiveToolsCacheKey = null;
-    lastPromptStateCacheKey = null;
   };
 
   const resetShownWarnings = (): void => {
@@ -1522,21 +1518,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       lastActiveToolsCacheKey = activeToolsCacheKey;
     }
 
-    const promptStateCacheKey = createBeforeAgentStartPromptStateKey({
-      agentName,
-      cwd: ctx.cwd,
-      permissionStamp: permissionManager.getPolicyCacheStamp(agentName ?? undefined),
-      systemPrompt: event.systemPrompt,
-      allowedToolNames: allowedTools,
-    });
-
-    if (!shouldApplyCachedAgentStartState(lastPromptStateCacheKey, promptStateCacheKey)) {
-      return {};
-    }
-
-    lastPromptStateCacheKey = promptStateCacheKey;
-    const toolPromptResult = sanitizeAvailableToolsSection(event.systemPrompt, allowedTools);
-    const skillPromptResult = resolveSkillPromptEntries(toolPromptResult.prompt, permissionManager, agentName, ctx.cwd);
+    const skillPromptResult = resolveSkillPromptEntries(event.systemPrompt, permissionManager, agentName, ctx.cwd);
     activeSkillEntries = skillPromptResult.entries;
 
     if (skillPromptResult.prompt !== event.systemPrompt) {
